@@ -1,0 +1,214 @@
+# AgentCoach — Architecture Design Document
+
+## 1. Problem Statement
+
+ML/AI interview preparation is unstructured. Candidates study randomly, don't know their gaps, and practice without feedback. Existing tools are static question banks with no adaptivity.
+
+**AgentCoach** solves this with a multi-agent AI system that:
+- Identifies skill gaps dynamically
+- Generates personalized study plans
+- Conducts realistic mock interviews with adaptive difficulty
+- Evaluates answers on multiple dimensions
+- Provides company-specific preparation strategy
+
+---
+
+## 2. Architecture Pattern: Router vs Supervisor
+
+### Why Router Pattern (not Supervisor)?
+
+| Dimension | Supervisor (Pre-Auth) | Router (AgentCoach) |
+|-----------|----------------------|---------------------|
+| **Trigger** | External event (claim submitted) | User message (open-ended) |
+| **Workflow** | Fixed: retrieve → analyze → validate → respond | Dynamic: depends on user intent |
+| **Routing logic** | Deterministic pipeline | Semantic intent classification |
+| **When to use** | Known, repeatable workflows | Open-ended, conversational systems |
+
+**Decision rationale**: In Pre-Auth, every claim follows the same 4-step pipeline — Supervisor pattern fits because the workflow is deterministic. In AgentCoach, the user might ask for a study plan, then switch to a mock interview, then ask for strategy advice — the system must classify intent on every message and route to the correct agent. Router pattern fits because the workflow is user-driven, not system-driven.
+
+**Interview script**: "I chose the Router pattern for AgentCoach because user intent drives agent selection — unlike my Pre-Auth system where claims follow a fixed pipeline suited to the Supervisor pattern. The Router classifies each message semantically and routes to the appropriate specialist agent, which means the system adapts to conversational flow rather than forcing a predetermined sequence."
+
+---
+
+## 3. Agent Inventory
+
+### 3.1 Router Agent (Orchestrator)
+- **Responsibility**: Classify user intent → select specialist agent → manage handoff
+- **Input**: User message + conversation history + current mode
+- **Output**: Classified intent + selected agent + confidence score
+- **LLM Tier**: SIMPLE (GPT-4o-mini) — classification is cheap, do it fast
+- **Failure mode**: Low confidence → ask user to clarify
+
+### 3.2 ProfileManager Agent
+- **Responsibility**: Maintain user profile, track skill gaps, manage memory
+- **Input**: User messages containing profile info, assessment results
+- **Output**: Updated user profile, skill scores
+- **LLM Tier**: COMPLEX (GPT-4o) — needs to extract structured info from unstructured conversation
+- **Failure mode**: Missing profile fields → ask targeted questions
+
+### 3.3 StudyPlanner Agent
+- **Responsibility**: Generate and adapt study plans based on gaps + timeline
+- **Input**: Skill scores, interview dates, company targets, available hours
+- **Output**: Structured daily/weekly plan
+- **LLM Tier**: COMPLEX (GPT-4o) — planning requires reasoning
+- **Failure mode**: Insufficient info → request missing inputs (dates, hours)
+
+### 3.4 MockInterviewer Agent
+- **Responsibility**: Conduct realistic interview simulations
+- **Input**: Topic, difficulty, company context, user skill level
+- **Output**: Questions, follow-ups, session management
+- **LLM Tier**: COMPLEX (GPT-4o) — needs to simulate interviewer behavior
+- **Failure mode**: User off-topic → redirect; session timeout → graceful end
+
+### 3.5 AnswerEvaluator Agent
+- **Responsibility**: Score answers, identify gaps, generate ideal answers
+- **Input**: Question + user answer + rubric
+- **Output**: Multi-dimensional scores + feedback + ideal answer
+- **LLM Tier**: COMPLEX (GPT-4o) — evaluation requires deep reasoning
+- **Failure mode**: Ambiguous answer → request clarification before scoring
+
+### 3.6 StrategyAdvisor Agent
+- **Responsibility**: Company-specific preparation advice
+- **Input**: Company name, role, user profile
+- **Output**: Focus areas, what to skip, interview patterns
+- **LLM Tier**: COMPLEX (GPT-4o) — needs to synthesize company knowledge
+- **Failure mode**: Unknown company → fall back to generic senior ML patterns
+
+---
+
+## 4. State Schema
+
+```python
+class AgentState(TypedDict, total=False):
+    # User context
+    user_profile: dict
+    
+    # Conversation
+    messages: list[dict]          # [{role: "user"/"assistant", content: str}]
+    current_input: str            # Latest user message
+    
+    # Routing
+    current_mode: str             # planning|interviewing|evaluating|strategy|chat|profile
+    current_agent: str            # Active agent name
+    route_confidence: float       # Router confidence (0-1)
+    
+    # Agent output
+    agent_response: str           # Response to return to user
+    
+    # Session data
+    active_interview: dict        # Mock interview session state
+    study_plan: dict              # Current plan
+    
+    # Memory
+    memory_context: str           # Retrieved long-term memories
+    session_summary: str          # Current session summary
+    
+    # Control
+    step_count: int               # Loop guard (max 5)
+    is_complete: bool             # Terminal flag
+    error: str | None             # Error capture
+```
+
+---
+
+## 5. LangGraph Flow
+
+```
+                    ┌─────────────┐
+                    │  User Input  │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │   Router     │ ← Classifies intent
+                    │  (GPT-4o-   │
+                    │   mini)      │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │            (+ 2 more)
+        ┌─────▼────┐ ┌────▼─────┐ ┌───▼──────┐
+        │ Profile   │ │ Planner  │ │Interview │
+        │ Manager   │ │          │ │  er      │
+        └─────┬────┘ └────┬─────┘ └───┬──────┘
+              │            │            │
+              └────────────┼────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Response    │ ← Format + return
+                    │  Formatter   │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │    END       │
+                    └─────────────┘
+```
+
+### Conditional Edges (Router → Agent):
+```python
+def route_to_agent(state: AgentState) -> str:
+    mode = state.get("current_mode", "chat")
+    confidence = state.get("route_confidence", 0.0)
+    
+    if confidence < 0.7:
+        return "clarify"          # Ask user to clarify
+    
+    routing_map = {
+        "profile": "profile_agent",
+        "planning": "planner_agent",
+        "interviewing": "interviewer_agent",
+        "evaluating": "evaluator_agent",
+        "strategy": "strategy_agent",
+        "chat": "general_chat",
+    }
+    return routing_map.get(mode, "general_chat")
+```
+
+---
+
+## 6. Failure Mode Analysis
+
+| Failure | Detection | Response | Recovery |
+|---------|-----------|----------|----------|
+| Router misclassifies intent | User corrects or seems confused | Ask: "It sounds like you want X. Is that right?" | Re-route to correct agent |
+| Agent timeout (>30s) | Timer in orchestration layer | Return: "Taking longer than expected, let me try again." | Retry once, then fallback |
+| LLM returns empty/invalid | Output validation (Pydantic) | Log error, return safe template response | Retry with simpler prompt |
+| State corruption | Pydantic validation on every state write | Log corrupted state, reset affected fields | Checkpoint restore |
+| Infinite loop | step_count > 5 | Force terminate, return partial result | Reset step_count, log trace |
+| Memory retrieval failure | Empty vector search results | Proceed without memory context | Log for debugging |
+
+---
+
+## 7. Cost Architecture
+
+| Agent | LLM Tier | Est. tokens/call | Est. cost/call |
+|-------|----------|-------------------|----------------|
+| Router | GPT-4o-mini | ~500 in + 50 out | $0.0001 |
+| ProfileManager | GPT-4o | ~1500 in + 500 out | $0.015 |
+| StudyPlanner | GPT-4o | ~2000 in + 800 out | $0.022 |
+| MockInterviewer | GPT-4o | ~1500 in + 300 out | $0.012 |
+| AnswerEvaluator | GPT-4o | ~2000 in + 600 out | $0.019 |
+| StrategyAdvisor | GPT-4o | ~1500 in + 500 out | $0.015 |
+
+**Estimated cost per full session** (~20 messages): $0.30 - $0.50
+
+**Optimization levers**:
+1. Router uses GPT-4o-mini (10x cheaper than GPT-4o)
+2. Cache frequent routing patterns (same intent → skip LLM call)
+3. Summarize conversation history instead of passing full context
+4. Token budget allocator prevents context window waste
+
+---
+
+## 8. Technology Stack
+
+| Layer | Technology | Why |
+|-------|-----------|-----|
+| LLM | Azure OpenAI (GPT-4o, GPT-4o-mini) | Enterprise-grade, same as production at IBM |
+| Orchestration | LangGraph | Stateful multi-agent with conditional routing, checkpointing |
+| API | FastAPI | Async, type-safe, auto-docs, production-ready |
+| State Persistence | SQLite + SQLAlchemy | Lightweight, zero-infra for MVP, upgrade path to Postgres |
+| Vector Store | FAISS (local) | Fast, no external dependency for MVP |
+| Embeddings | Azure OpenAI ada-002 | Consistent with production stack |
+| Testing | pytest + LLM-as-judge | Unit tests for logic, LLM eval for quality |
+| Containerization | Docker + docker-compose | Reproducible, deployable |
+| CI/CD | GitHub Actions | Free, integrated with repo |
